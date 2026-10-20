@@ -11,3 +11,4 @@ frequency-*.csv
 *.egg-info/
 dist/
 build/
+apa_results/
