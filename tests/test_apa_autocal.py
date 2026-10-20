@@ -97,7 +97,7 @@ class ParseTests(unittest.TestCase):
             "2026-10-20 11:57:01 [INFO] Calculation result: 999\n"
             "2026-10-20 11:57:32 [INFO] Received request: loop=14, slowv=5.078, fastv=6.770\n"
             "2026-10-20 11:57:32 [INFO] Calculation result: -18864\n")
-        fast = 200 * 0.033851
+        fast = 200 * 0.033851  # the ratio the macros used when this real log was recorded
         self.assertEqual(apa.flow_log_areas(log, fast * 0.75, fast), [-5421.0, -18864.0])
 
     def test_console_log(self):
@@ -464,7 +464,10 @@ class MockMoonraker:
                     await ws.send("this is not json")
                 await self.send_lines(ws, lines)
             reply = {"jsonrpc": "2.0", "id": rid}
-            reply.update({"error": {"code": 400, "message": error}} if error else {"result": result})
+            if error:
+                reply["error"] = {"code": 400, "message": error}
+            else:
+                reply["result"] = result
             await ws.send(json.dumps(reply))
 
     def run_gcode(self, script):

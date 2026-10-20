@@ -501,7 +501,7 @@ class Moonraker:
                 return ""
             raise
 
-    async def get_text(self, path: str, timeout: float = 30.0) -> str:
+    async def get_text(self, path: str, timeout: float) -> str:
         """HTTP GET from Moonraker without blocking the websocket's event loop.
 
         A missing file (404) reads as an empty string.
@@ -655,7 +655,7 @@ class Session:
         await self.console_finish(p)
 
     async def console_finish(self, p: dict) -> None:
-        """Echo the result through APA_FINISH_CELL so the web UI console shows it too, and cross-check."""
+        """Echo the result via APA_FINISH_CELL so the web UI console shows it; cross-check it."""
         k0, a0, k1, a1 = p["bracket"]
         cmd = ("APA_FINISH_CELL K0=%.3f A0=%.3f K1=%.3f A1=%.3f FLOW=%.4f ACCEL=%g "
                "NAME=%s MAX_ABS=%.3f" % (k0, a0, k1, a1, p["flow"], p["accel"],

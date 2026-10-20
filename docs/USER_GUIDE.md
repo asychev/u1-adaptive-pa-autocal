@@ -77,8 +77,11 @@ Rows graded *weak* or *unusable* (confidence below 45) are left out of the Orca 
 
 | Option | Use |
 |--------|-----|
-| `--points center,high_flow` | Run only some points |
+| `--points center,high_flow` | Run only some points (`--skip-stress` leaves out the stress corner) |
+| `--dry-run` | Check the printer and print the commands; no heating or motion |
 | `--resume apa_results/<timestamp>` | Continue an interrupted session; finished points are kept |
+| `--out DIR` | Parent folder for session results (default `apa_results`) |
+| `--max-retries N` / `--refine-below N` | Moved-range re-runs per point (default 2) / confidence that triggers the fine scan (default 45, 0 = off) |
 | `--parse-log console.txt` | Offline: finish points from a console log saved from Fluidd/Mainsail (no printer needed) |
 | `--api-key KEY` | Only if Moonraker requires one for your network |
 
@@ -284,7 +287,7 @@ APA_ORCA_LINE K=0.024 FLOW=16.28 ACCEL=6000 NAME=manual_entry
 | :--- | :--- | :--- |
 | `Unknown command: "APA_COIL_1"` | Digits in macro name | Use named macro like `APA_COIL_LOW_ANCHOR`. |
 | `Unknown command: "APA_COIL_RUN_ALL"` after a firmware update | Update rewrote `printer.cfg` and dropped the `[include]` | Re-add it, or on paxx12 firmware move the file to `config/extended/klipper/`. |
-| `apa_autocal.py` stops with "no sign flip" | $K^*$ far outside the range even after retries | Raise `--max-retries` or set a different `k_min`/`k_max` in `_APA_COIL_CFG`. |
+| `apa_autocal.py` shows a point as `kstar_above` / `kstar_below` ("no sign flip") | $K^*$ far outside the range even after retries | Raise `--max-retries`, or set a different `k_min`/`k_max` in `_APA_COIL_CFG`, then `--resume` the session. |
 | `extruder ... not activated` | Active tool mismatch | Run `APA_SELECT_TOOL EXTRUDER=n`. |
 | All `area` values have the same sign | $K^*$ is outside current scan range | Widen `MIN` or `MAX` search bounds. |
 | Low `area` magnitudes (~hundreds) | Weak excitation signal (low speed) | Point has weak SNR, do not overfit. |
