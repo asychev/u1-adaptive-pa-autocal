@@ -42,8 +42,9 @@ import re
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from http.client import HTTPException
 from typing import Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -68,8 +69,18 @@ GRADE_FAIR = 45
 K_HARD_MAX = 0.2
 FINE_STEP = 0.001
 SECONDS_PER_K = 40.0
+# A sweep that takes longer than this is treated as a hung printer
+SWEEP_TIMEOUT_PER_K = 5 * SECONDS_PER_K
+SWEEP_TIMEOUT_EXTRA = 600.0
+# Console lines can trail the RPC reply slightly; wait this long before parsing
+CONSOLE_DRAIN_S = 0.5
+# flow_calculator.log is only a fallback, so don't let a slow download stall a sweep
+FLOW_LOG_TIMEOUT = 5.0
+# Keys run_point() writes; cleared before a point is (re)measured
+RESULT_KEYS = ("status", "bracket", "k_star", "k_out", "confidence", "grade", "snr",
+               "balance", "clean_zero", "peak", "samples")
 
-AREA_RE = re.compile(r"k(\d+(?:\.\d+)?):\s*area\s*[=:]\s*([+-]?\d+(?:\.\d+)?)")
+AREA_RE = re.compile(r"\bk(\d+(?:\.\d+)?):\s*area\s*[=:]\s*([+-]?\d+(?:\.\d+)?)")
 ABORT_RE = re.compile(r"abort calibration.*", re.IGNORECASE)
 TEMP_REPORT_RE = re.compile(r"^B:\S+\s*/\S+\s")
 POINT_BANNER_RE = re.compile(r"Point:\s*(\S+)\s*\|\s*Tool T(\d+)")
@@ -106,20 +117,13 @@ def expected_ks(k_min: float, k_max: float, k_step: float) -> List[float]:
     return [i / 1000.0 for i in range(lo, hi, st)]
 
 
-@dataclass
-class Bracket:
-    k0: float
-    a0: float
-    k1: float
-    a1: float
-
-
-def find_bracket(samples: Dict[float, float]) -> Tuple[Optional[Bracket], str, int]:
+def find_bracket(samples: Dict[float, float]) -> Tuple[Optional[List[float]], str, int]:
     """First positive->negative step in k order.
 
-    Returns (bracket, status, sign_changes). Status is ``ok``, ``kstar_above``
-    (every area > 0, K too low), ``kstar_below`` (every area < 0, K too high),
-    ``no_flip`` (signs change but never + -> -) or ``no_data``.
+    Returns (bracket, status, sign_changes); bracket is [k0, a0, k1, a1] or None.
+    Status is ``ok``, ``kstar_above`` (every area > 0, K too low), ``kstar_below``
+    (every area < 0, K too high), ``no_flip`` (signs change but never + -> -) or
+    ``no_data``.
     """
     pts = sorted(samples.items())
     if not pts:
@@ -128,7 +132,7 @@ def find_bracket(samples: Dict[float, float]) -> Tuple[Optional[Bracket], str, i
     changes = sum(1 for s0, s1 in zip(signs, signs[1:]) if s0 != s1)
     for (k0, a0), (k1, a1) in zip(pts, pts[1:]):
         if a0 >= 0 >= a1 and not (a0 == 0 and a1 == 0):
-            return Bracket(k0, a0, k1, a1), "ok", changes
+            return [k0, a0, k1, a1], "ok", changes
     if all(a > 0 for _, a in pts):
         return None, "kstar_above", changes
     if all(a < 0 for _, a in pts):
@@ -199,8 +203,8 @@ def evaluate(samples: Dict[float, float]) -> dict:
     if bracket is None:
         return out
     peak = max(abs(a) for a in samples.values())
-    out["bracket"] = [bracket.k0, bracket.a0, bracket.k1, bracket.a1]
-    out.update(score(bracket.k0, bracket.a0, bracket.k1, bracket.a1, peak))
+    out["bracket"] = bracket
+    out.update(score(*bracket, peak))
     return out
 
 
@@ -258,6 +262,44 @@ def flow_log_areas(text: str, slowv: float, fastv: float) -> List[float]:
     return out
 
 
+def recover_from_flow_log(areas: List[float], baseline: Optional[int],
+                          ks: List[float]) -> Optional[Dict[float, float]]:
+    """Map the results one sweep added to flow_calculator.log onto its K values.
+
+    ``baseline`` is how many matching results the log had before the sweep.
+    Only an exact count of new results is trusted; anything else (log rotated,
+    unreadable before the sweep, results missing) returns None rather than
+    borrowing values from an earlier sweep at the same speeds.
+    """
+    if baseline is None or len(areas) - baseline != len(ks):
+        return None
+    return dict(zip(ks, areas[baseline:]))
+
+
+def usable(p: dict) -> bool:
+    """Point belongs in the Orca table: finished, fair or better, known flow."""
+    return (p.get("status") == "ok" and p["confidence"] >= GRADE_FAIR
+            and p.get("flow", 0) > 0)
+
+
+def atomic_write(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:  # Windows: file briefly held by a scanner/editor
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def parse_console_log(text: str) -> List[dict]:
     """Split a saved console log into test points using the macro banners."""
     points: List[dict] = []
@@ -312,14 +354,13 @@ def format_tool_report(tool: int, temp, points: List[dict]) -> str:
             lines.append("%-11s %6.0f %6.0f %6.2f  %-6s %4s  %-9s %s" % (
                 p["name"], p["speed"], p["accel"], p["flow"], "-", "-",
                 p.get("status", "pending"), "; ".join(p.get("notes", []))))
-    rows = [orca_row(p["k_out"], p["flow"], p["accel"]) for p in points
-            if p.get("status") == "ok" and p["confidence"] >= GRADE_FAIR]
-    weak = [p["name"] for p in points
-            if p.get("status") == "ok" and p["confidence"] < GRADE_FAIR]
+    rows = [orca_row(p["k_out"], p["flow"], p["accel"]) for p in points if usable(p)]
+    left_out = [p["name"] for p in points if p.get("status") == "ok" and not usable(p)]
     lines.append("--- OrcaSlicer: Filament > Adaptive pressure advance measurements ---")
     lines.extend(rows or ["(no usable rows)"])
-    if weak:
-        lines.append("(left out, confidence below %d: %s)" % (GRADE_FAIR, ", ".join(weak)))
+    if left_out:
+        lines.append("(left out - confidence below %d or flow unknown: %s)"
+                     % (GRADE_FAIR, ", ".join(left_out)))
     fb = fallback_pa(points)
     if fb is not None:
         lines.append("Fallback static Pressure advance (median K*): %.3f" % fb)
@@ -327,23 +368,24 @@ def format_tool_report(tool: int, temp, points: List[dict]) -> str:
 
 
 def write_orca_file(path: str, tool: int, points: List[dict]) -> None:
-    rows = [orca_row(p["k_out"], p["flow"], p["accel"]) for p in points
-            if p.get("status") == "ok" and p["confidence"] >= GRADE_FAIR]
+    lines = ["# T%d Adaptive PA rows: PA, flow_mm3_s, accel_mm_s2" % tool]
     fb = fallback_pa(points)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# T%d Adaptive PA rows: PA, flow_mm3_s, accel_mm_s2\n" % tool)
-        if fb is not None:
-            f.write("# fallback static pressure advance: %.3f\n" % fb)
-        for r in rows:
-            f.write(r + "\n")
+    if fb is not None:
+        lines.append("# fallback static pressure advance: %.3f" % fb)
+    lines.extend(orca_row(p["k_out"], p["flow"], p["accel"]) for p in points if usable(p))
+    atomic_write(path, "\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Moonraker websocket client
 # ---------------------------------------------------------------------------
 
+class ApaError(Exception):
+    """Problem to report to the user and stop (printer unreachable, macros missing...)."""
+
+
 class GcodeError(RuntimeError):
-    pass
+    """A G-code command failed; the current test point is marked as error."""
 
 
 def normalize_host(host: str) -> str:
@@ -362,12 +404,13 @@ class Moonraker:
         self._id = 0
         self._pending: Dict[int, asyncio.Future] = {}
         self._reader: Optional[asyncio.Task] = None
+        self._closed_error: tuple = ()  # websockets' ConnectionClosed once connected
 
     async def connect(self) -> None:
         try:
             import websockets
         except ImportError as e:
-            raise SystemExit("Needs: pip install websockets (%s)" % e) from e
+            raise ApaError("Needs: pip install websockets (%s)" % e) from e
         headers = {"X-Api-Key": self.api_key} if self.api_key else None
         kwargs = {"max_size": None}
         if headers:
@@ -375,10 +418,11 @@ class Moonraker:
         try:
             self._ws = await websockets.connect("ws://%s/websocket" % self.host, **kwargs)
         except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as e:
-            raise SystemExit(
+            raise ApaError(
                 "Cannot reach Moonraker at ws://%s/websocket (%s: %s)\n"
                 "Check the address, and that the web UI (Fluidd/Mainsail) opens at http://%s/"
                 % (self.host, type(e).__name__, e, self.host)) from e
+        self._closed_error = websockets.exceptions.ConnectionClosed
         self._reader = asyncio.create_task(self._read())
         await self.call("server.connection.identify", {
             "client_name": "apa-autocal", "version": "1.0", "type": "agent",
@@ -387,39 +431,52 @@ class Moonraker:
     async def close(self) -> None:
         if self._reader:
             self._reader.cancel()
+            await asyncio.gather(self._reader, return_exceptions=True)
         if self._ws is not None:
             await self._ws.close()
+
+    def _dispatch(self, msg: dict) -> None:
+        if msg.get("method") == "notify_gcode_response":
+            for line in msg.get("params", []):
+                self.lines.append(line)
+                if self.on_line:
+                    self.on_line(line)
+        elif msg.get("id") in self._pending:
+            fut = self._pending.pop(msg["id"])
+            if not fut.done():
+                fut.set_result(msg)
 
     async def _read(self) -> None:
         reason = "closed"
         try:
             async for raw in self._ws:
-                msg = json.loads(raw)
-                if msg.get("method") == "notify_gcode_response":
-                    for line in msg.get("params", []):
-                        self.lines.append(line)
-                        if self.on_line:
-                            self.on_line(line)
-                elif msg.get("id") in self._pending:
-                    fut = self._pending.pop(msg["id"])
-                    if not fut.done():
-                        fut.set_result(msg)
+                try:
+                    self._dispatch(json.loads(raw))
+                except Exception as e:  # one bad message must not end the session
+                    sys.stderr.write("WARN: ignored Moonraker message (%s: %s)\n"
+                                     % (type(e).__name__, e))
         except Exception as e:
-            reason = str(e)
+            reason = "%s: %s" % (type(e).__name__, e)
         finally:  # connection gone: fail every waiter instead of hanging
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(ConnectionError("Moonraker connection lost: %s" % reason))
+                    fut.set_exception(ConnectionError("Moonraker connection lost (%s)" % reason))
             self._pending.clear()
 
     async def call(self, method: str, params: Optional[dict] = None,
                    timeout: Optional[float] = 30.0) -> dict:
         self._id += 1
+        req_id = self._id
         fut = asyncio.get_running_loop().create_future()
-        self._pending[self._id] = fut
-        await self._ws.send(json.dumps({"jsonrpc": "2.0", "method": method,
-                                        "params": params or {}, "id": self._id}))
-        msg = await asyncio.wait_for(fut, timeout)
+        self._pending[req_id] = fut
+        try:
+            await self._ws.send(json.dumps({"jsonrpc": "2.0", "method": method,
+                                            "params": params or {}, "id": req_id}))
+            msg = await asyncio.wait_for(fut, timeout)
+        except self._closed_error as e:  # one error type for "connection gone"
+            raise ConnectionError("Moonraker connection lost (%s)" % e) from e
+        finally:
+            self._pending.pop(req_id, None)
         if "error" in msg:
             err = msg["error"]
             raise GcodeError(err.get("message", str(err)) if isinstance(err, dict) else str(err))
@@ -432,12 +489,24 @@ class Moonraker:
         res = await self.call("printer.objects.query", {"objects": objects})
         return res["status"]
 
-    def get_text(self, path: str) -> str:
+    def _get_text(self, path: str, timeout: float) -> str:
         req = urllib.request.Request("http://%s%s" % (self.host, path))
         if self.api_key:
             req.add_header("X-Api-Key", self.api_key)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read().decode("utf-8", "replace")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # file not created yet: same as empty
+                return ""
+            raise
+
+    async def get_text(self, path: str, timeout: float = 30.0) -> str:
+        """HTTP GET from Moonraker without blocking the websocket's event loop.
+
+        A missing file (404) reads as an empty string.
+        """
+        return await asyncio.to_thread(self._get_text, path, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -468,26 +537,24 @@ class Session:
             print("    " + line.lstrip("/ ").strip(), flush=True)
 
     def save(self) -> None:
-        path = os.path.join(self.out_dir, "results.json")
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(self.state, f, indent=1)
-        os.replace(path + ".tmp", path)
+        atomic_write(os.path.join(self.out_dir, "results.json"),
+                     json.dumps(self.state, indent=1))
 
     # -- preflight ----------------------------------------------------------
     async def preflight(self) -> dict:
         info = await self.mr.call("server.info")
         if info.get("klippy_state") != "ready":
-            raise SystemExit("Klipper is not ready (state: %s)" % info.get("klippy_state"))
+            raise ApaError("Klipper is not ready (state: %s)" % info.get("klippy_state"))
         st = await self.mr.query({CFG_MACRO: None, "print_stats": ["state"]})
         cfg = st.get(CFG_MACRO) or {}
         if "line_area" not in cfg:
-            raise SystemExit(
+            raise ApaError(
                 "adaptive_pa_macro.cfg is not loaded on the printer (no _APA_COIL_CFG).\n"
                 "Copy it next to printer.cfg and add [include adaptive_pa_macro.cfg], or on\n"
                 "paxx12 extended firmware put it in config/extended/klipper/, then restart\n"
                 "Klipper.")
         if st.get("print_stats", {}).get("state") in ("printing", "paused"):
-            raise SystemExit("Printer is busy (print_stats: %s)" % st["print_stats"]["state"])
+            raise ApaError("Printer is busy (print_stats: %s)" % st["print_stats"]["state"])
         return {k: cfg[k] for k in ENVELOPE_KEYS}
 
     # -- one sweep ----------------------------------------------------------
@@ -503,9 +570,18 @@ class Session:
         if self.args.dry_run:
             print("    would send: " + cmd)
             return {}
+        fast = p["speed"] * float(cfg["ratio"])
+        slow = fast * float(cfg["slow_frac"])
+        baseline = await self._flow_log_areas(slow, fast)
         start = len(self.mr.lines)
         self.heated.add(tool)
-        await self.mr.gcode(cmd, timeout=None)
+        limit = len(ks) * SWEEP_TIMEOUT_PER_K + SWEEP_TIMEOUT_EXTRA
+        try:
+            await self.mr.gcode(cmd, timeout=limit)
+        except asyncio.TimeoutError as e:
+            raise ApaError("%s did not finish within %.0f min - is the printer stuck?"
+                           % (p["name"], limit / 60)) from e
+        await asyncio.sleep(CONSOLE_DRAIN_S)
         got: Dict[float, float] = {}
         for line in self.mr.lines[start:]:
             if ABORT_RE.search(line):
@@ -515,34 +591,33 @@ class Session:
                 got[a[0]] = a[1]
         missing = [k for k in ks if k not in got]
         if missing:
-            got.update(self._from_flow_log(p, ks, missing, cfg))
+            after = await self._flow_log_areas(slow, fast)
+            recovered = recover_from_flow_log(after or [], None if baseline is None
+                                              else len(baseline), ks)
+            if recovered is None:
+                print("    WARN: %d area line(s) missing and flow_calculator.log can't be "
+                      "matched to this sweep" % len(missing))
+            else:
+                got.update({k: recovered[k] for k in missing})
+                print("    recovered %d area value(s) from flow_calculator.log" % len(missing))
         return got
 
-    def _from_flow_log(self, p: dict, ks: List[float], missing: List[float],
-                       cfg: dict) -> Dict[float, float]:
-        """Recover area values the console stream missed from flow_calculator.log."""
-        fast = p["speed"] * float(cfg["ratio"])
-        slow = fast * float(cfg["slow_frac"])
+    async def _flow_log_areas(self, slow: float, fast: float) -> Optional[List[float]]:
+        """Matching results currently in flow_calculator.log, or None if unreadable."""
         try:
-            text = self.mr.get_text("/server/files/logs/flow_calculator.log")
-        except Exception as e:
-            print("    WARN: %d area line(s) missing and flow_calculator.log unreadable: %s"
-                  % (len(missing), e))
-            return {}
-        areas = flow_log_areas(text, slow, fast)
-        if len(areas) < len(ks):
-            print("    WARN: %d area line(s) missing; flow_calculator.log has too few results"
-                  % len(missing))
-            return {}
-        recovered = dict(zip(ks, areas[-len(ks):]))
-        print("    recovered %d area value(s) from flow_calculator.log" % len(missing))
-        return {k: recovered[k] for k in missing}
+            text = await self.mr.get_text("/server/files/logs/flow_calculator.log",
+                                          timeout=FLOW_LOG_TIMEOUT)
+        except (OSError, ValueError, HTTPException):  # best effort: never stop the run
+            return None
+        return flow_log_areas(text, slow, fast)
 
     # -- one test point -----------------------------------------------------
     async def run_point(self, tool: int, p: dict, temp: int, cfg: dict) -> None:
         k_min, k_max, k_step = (float(cfg["k_min"]), float(cfg["k_max"]), float(cfg["k_step"]))
         samples: Dict[float, float] = {}
-        p.setdefault("sweeps", [])
+        for key in RESULT_KEYS:  # a re-run starts clean, not from a failed attempt
+            p.pop(key, None)
+        p["sweeps"] = []
         p["notes"] = []
         retries = 0
         while True:
@@ -588,9 +663,10 @@ class Session:
         start = len(self.mr.lines)
         try:
             await self.mr.gcode(cmd, timeout=30)
-        except Exception as e:
-            p["notes"].append("APA_FINISH_CELL failed: %s" % e)
+        except (GcodeError, asyncio.TimeoutError) as e:
+            p["notes"].append("APA_FINISH_CELL failed: %s" % (str(e) or type(e).__name__))
             return
+        await asyncio.sleep(CONSOLE_DRAIN_S)
         text = "\n".join(self.mr.lines[start:])
         mc, mk = FINISH_CONF_RE.search(text), FINISH_K_RE.search(text)
         if mc and mk and (int(mc.group(1)) != p["confidence"]
@@ -599,59 +675,68 @@ class Session:
 
     # -- whole run ----------------------------------------------------------
     async def run(self) -> None:
-        await self.mr.connect()
         try:
-            live_cfg = await self.preflight()
-            cfg = self.state.setdefault("envelope", live_cfg)
-            if cfg != live_cfg and not self.args.dry_run:
-                print("NOTE: resuming with the envelope saved in results.json")
-            temp = self.state.setdefault("temp", self.args.temp or int(cfg["temp"]))
-            names = self.args.points.split(",") if self.args.points else None
-            plan = build_points(cfg, names, self.args.skip_stress)
-            tools = self.state.setdefault("tools", {})
-            for t in self.args.tool_list:
-                entry = tools.setdefault(str(t), {"points": []})
-                known = {p["name"] for p in entry["points"]}
-                entry["points"].extend(dict(p) for p in plan if p["name"] not in known)
-
-            total = sum(1 for e in tools.values() for p in e["points"] if p.get("status") != "ok")
-            print("APA autocal @ %s  tools=%s  temp=%s  points to run=%d (~%d min before retries)"
-                  % (self.mr.host, ",".join(tools), temp, total,
-                     total * len(expected_ks(cfg["k_min"], cfg["k_max"], cfg["k_step"]))
-                     * SECONDS_PER_K / 60))
-            print("Output: %s" % self.out_dir)
-            for t_str, entry in tools.items():
-                tool = int(t_str)
-                print("\n--- T%d ---" % tool, flush=True)
-                for p in entry["points"]:
-                    if p.get("status") == "ok":
-                        print("  %s: done (K*=%.3f), skipping" % (p["name"], p["k_out"]))
-                        continue
-                    try:
-                        await self.run_point(tool, p, temp, cfg)
-                    except GcodeError as e:
-                        p["status"] = "error"
-                        p.setdefault("notes", []).append(str(e))
-                        print("    %s failed: %s" % (p["name"], e), flush=True)
-                    if not self.args.dry_run:
-                        self.save()
-                        if p.get("status") == "ok":
-                            print("    %s: K*=%.3f  confidence %d (%s)" % (
-                                p["name"], p["k_out"], p["confidence"], p["grade"]), flush=True)
-                if not self.args.dry_run:
-                    entry["fallback_pa"] = fallback_pa(entry["points"])
-                    self.save()
-                    write_orca_file(os.path.join(self.out_dir, "orca_T%d.txt" % tool),
-                                    tool, entry["points"])
-                    await self.heaters_off([tool])
-            if not self.args.dry_run:
-                for t_str, entry in tools.items():
-                    print(format_tool_report(int(t_str), temp, entry["points"]))
-                print("\nSaved: %s" % self.out_dir)
+            await self.mr.connect()
+            await self._run()
         finally:
-            await self.heaters_off(sorted(self.heated))
-            await self.mr.close()
-            self._log.close()
+            try:
+                await self.heaters_off(sorted(self.heated))
+            finally:
+                await self.mr.close()
+                self._log.close()
+
+    async def _run(self) -> None:
+        live_cfg = await self.preflight()
+        cfg = self.state.setdefault("envelope", live_cfg)
+        if cfg != live_cfg and not self.args.dry_run:
+            print("NOTE: resuming with the envelope saved in results.json")
+        temp = self.state.setdefault(
+            "temp", self.args.temp if self.args.temp is not None else int(cfg["temp"]))
+        plan = build_points(cfg, self.args.point_names, self.args.skip_stress)
+        wanted = {p["name"] for p in plan}
+        tools = self.state.setdefault("tools", {})
+        for t in self.args.tool_list:
+            entry = tools.setdefault(str(t), {"points": []})
+            known = {p["name"] for p in entry["points"]}
+            entry["points"].extend(dict(p) for p in plan if p["name"] not in known)
+
+        total = sum(1 for t in self.args.tool_list for p in tools[str(t)]["points"]
+                    if p["name"] in wanted and p.get("status") != "ok")
+        print("APA autocal @ %s  tools=%s  temp=%s  points to run=%d (~%d min before retries)"
+              % (self.mr.host, ",".join(map(str, self.args.tool_list)), temp, total,
+                 total * len(expected_ks(cfg["k_min"], cfg["k_max"], cfg["k_step"]))
+                 * SECONDS_PER_K / 60))
+        print("Output: %s" % self.out_dir)
+        for tool in self.args.tool_list:
+            entry = tools[str(tool)]
+            print("\n--- T%d ---" % tool, flush=True)
+            for p in entry["points"]:
+                if p["name"] not in wanted:
+                    continue
+                if p.get("status") == "ok":
+                    print("  %s: done (K*=%.3f), skipping" % (p["name"], p["k_out"]))
+                    continue
+                try:
+                    await self.run_point(tool, p, temp, cfg)
+                except GcodeError as e:
+                    p["status"] = "error"
+                    p.setdefault("notes", []).append(str(e))
+                    print("    %s failed: %s" % (p["name"], e), flush=True)
+                if not self.args.dry_run:
+                    self.save()
+                    if p.get("status") == "ok":
+                        print("    %s: K*=%.3f  confidence %d (%s)" % (
+                            p["name"], p["k_out"], p["confidence"], p["grade"]), flush=True)
+            if not self.args.dry_run:
+                entry["fallback_pa"] = fallback_pa(entry["points"])
+                self.save()
+                write_orca_file(os.path.join(self.out_dir, "orca_T%d.txt" % tool),
+                                tool, entry["points"])
+                await self.heaters_off([tool])
+        if not self.args.dry_run:
+            for tool in self.args.tool_list:
+                print(format_tool_report(tool, temp, tools[str(tool)]["points"]))
+            print("\nSaved: %s" % self.out_dir)
 
     async def heaters_off(self, tools: List[int]) -> None:
         # FLOW_MEASURE_K leaves the nozzle at 170 C; turn it off explicitly.
@@ -660,8 +745,9 @@ class Session:
                 await self.mr.gcode("SET_HEATER_TEMPERATURE HEATER=%s TARGET=0"
                                     % heater_name(t), timeout=10)
                 self.heated.discard(t)
-            except Exception:
-                pass
+            except Exception as e:  # never let cleanup hide the original error
+                print("WARN: could not confirm T%d heater off (%s); check it in Fluidd/Mainsail"
+                      % (t, str(e) or type(e).__name__), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -672,22 +758,26 @@ def run_parse_log(path: str) -> None:
     with open(path, encoding="utf-8", errors="replace") as f:
         points = parse_console_log(f.read())
     if not points:
-        raise SystemExit("No APA test point banners found in %s" % path)
+        raise ApaError("No APA test point banners found in %s" % path)
     by_tool: Dict[int, List[dict]] = {}
     for p in points:
         p.update(evaluate(p["samples"]))
-        p.setdefault("speed", 0.0)
-        p.setdefault("accel", 0.0)
-        p.setdefault("flow", 0.0)
+        if "flow" not in p:
+            p.update(speed=0.0, accel=0.0, flow=0.0)
+            p["notes"].append("no XY banner - speed/flow unknown")
         by_tool.setdefault(p["tool"], []).append(p)
     for tool, pts in sorted(by_tool.items()):
         print(format_tool_report(tool, "?", pts))
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Run the APA suite over Moonraker and finish every point automatically.")
-    ap.add_argument("--host", help="Printer address, e.g. 192.168.1.50")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--host", help="Printer address, e.g. 192.168.1.50 "
+                     "(default with --resume: the session's printer)")
+    src.add_argument("--parse-log", default=None,
+                     help="Offline: finish points from a saved console log")
     ap.add_argument("--api-key", default=None, help="Moonraker API key (if required)")
     ap.add_argument("--tools", default=None,
                     help="Comma-separated tool indexes (default: 0, or the resumed session's)")
@@ -705,29 +795,54 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--resume", default=None, help="Session directory to continue")
     ap.add_argument("--dry-run", action="store_true",
                     help="Check the printer and print the plan; no heating or motion")
-    ap.add_argument("--parse-log", default=None,
-                    help="Offline: finish points from a saved console log")
     args = ap.parse_args(argv)
 
+    # Console lines from the printer may contain characters a Windows console can't show
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     if args.parse_log:
-        run_parse_log(args.parse_log)
-        return
-    if not args.host:
-        ap.error("--host is required (or use --parse-log)")
+        try:
+            run_parse_log(args.parse_log)
+        except ApaError as e:
+            print(e, file=sys.stderr)
+            return 1
+        return 0
+
     try:
         args.tool_list = [int(t) for t in (args.tools or "").split(",") if t.strip()]
     except ValueError:
         ap.error("--tools must look like 0,1,2")
     if any(t < 0 or t > 3 for t in args.tool_list):
         ap.error("tool indexes must be 0..3")
+    args.point_names = [n.strip() for n in args.points.split(",")] if args.points else None
+    unknown = set(args.point_names or []) - {name for name, _, _ in POINTS}
+    if unknown:
+        ap.error("unknown point(s) %s; choose from %s"
+                 % (", ".join(sorted(unknown)), ", ".join(name for name, _, _ in POINTS)))
+    if args.max_retries < 0 or not 0 <= args.refine_below <= 100:
+        ap.error("--max-retries must be >= 0 and --refine-below 0..100")
+    if args.temp is not None and args.temp <= 0:
+        ap.error("--temp must be a positive temperature")
 
     state: dict = {}
     if args.resume:
         out_dir = args.resume
-        with open(os.path.join(out_dir, "results.json"), encoding="utf-8") as f:
-            state = json.load(f)
+        try:
+            with open(os.path.join(out_dir, "results.json"), encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError) as e:
+            ap.error("cannot resume from %s: %s" % (out_dir, e))
+        if args.temp is not None and "temp" in state and args.temp != state["temp"]:
+            ap.error("session was measured at %s C; start a new session for %s C"
+                     % (state["temp"], args.temp))
+        args.host = args.host or state.get("host")
+        state.pop("host", None)  # a new --host (printer got a new IP) replaces the saved one
     else:
         out_dir = os.path.join(args.out, time.strftime("%Y%m%d_%H%M%S"))
+    if not args.host:
+        ap.error("--host is required (or use --parse-log)")
     if not args.tool_list:
         args.tool_list = [int(t) for t in state.get("tools", {})] or [0]
     if not args.dry_run:
@@ -736,13 +851,30 @@ def main(argv: Optional[List[str]] = None) -> None:
     state.setdefault("started", time.strftime("%Y-%m-%d %H:%M:%S"))
 
     session = Session(args, out_dir, state)
+
+    def hint() -> str:
+        # Only point at --resume when there is a saved session to continue
+        if os.path.exists(os.path.join(out_dir, "results.json")):
+            return "\nFinished points are saved; continue with: --resume %s" % out_dir
+        return ""
+
     try:
         asyncio.run(session.run())
+    except ApaError as e:
+        print("%s%s" % (e, hint()), file=sys.stderr)
+        return 1
+    except (ConnectionError, GcodeError, asyncio.TimeoutError) as e:
+        print("Stopped: %s%s" % (str(e) or "printer did not answer in time", hint()),
+              file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
-        print("\nInterrupted. The point that was running finishes on the printer; "
-              "cancel it from Fluidd/Mainsail if needed.\nResume with: --resume %s" % out_dir)
-        sys.exit(130)
+        print("\nInterrupted. The point that was running finishes on the printer; cancel it "
+              "from Fluidd/Mainsail if needed.\nCheck the nozzle heater: the heater-off sent "
+              "on exit may only run after that point, or not at all if the connection "
+              "dropped.%s" % hint())
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

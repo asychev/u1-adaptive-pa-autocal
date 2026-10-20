@@ -2,21 +2,28 @@
 
   python -m pytest tests            (or: python -m unittest discover tests)
 
-The macro-parity test renders APA_FINISH_CELL from adaptive_pa_macro.cfg with
-jinja2 and the end-to-end test runs against a mock Moonraker built on
-websockets; each is skipped when its package is missing.
+The macro tests render adaptive_pa_macro.cfg with jinja2 and the end-to-end
+tests run against a mock Moonraker built on websockets; each group is skipped
+when its package is missing.
 """
 
 import asyncio
+import contextlib
+import http.client
 import importlib.util
+import io
 import json
 import os
 import random
 import re
+import shutil
+import socket
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -45,6 +52,19 @@ REAL_FINISH = [
 ]
 
 
+class TempDirMixin:
+    def tmpdir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+    def patch(self, *args, **kwargs):
+        patcher = mock.patch.object(*args, **kwargs)
+        patched = patcher.start()
+        self.addCleanup(patcher.stop)
+        return patched
+
+
 class ParseTests(unittest.TestCase):
     def test_firmware_format(self):
         self.assertEqual(apa.parse_area("// k0.015: area=-5421.000"), (0.015, -5421.0))
@@ -55,6 +75,7 @@ class ParseTests(unittest.TestCase):
     def test_other_lines(self):
         self.assertIsNone(apa.parse_area("B:28.1 /0.0 T0:29.9 /220.0"))
         self.assertIsNone(apa.parse_area("// k min: 0.015, max: 0.025, step: 0.005"))
+        self.assertIsNone(apa.parse_area("mk0.015: area=1"))
 
     def test_expected_ks_exclusive_max(self):
         self.assertEqual(apa.expected_ks(0.005, 0.040, 0.005),
@@ -93,6 +114,12 @@ class ParseTests(unittest.TestCase):
         self.assertEqual((p["name"], p["tool"], p["speed"], p["accel"], p["flow"]),
                          ("center", 2, 200.0, 6000.0, 16.2832))
         self.assertEqual(p["samples"], {0.01: 30500.0, 0.015: 12740.0, 0.02: -3934.0})
+
+    def test_normalize_host(self):
+        for given in ("192.168.1.50", "http://192.168.1.50", "ws://192.168.1.50/websocket",
+                      " http://192.168.1.50/ "):
+            self.assertEqual(apa.normalize_host(given), "192.168.1.50")
+        self.assertEqual(apa.normalize_host("printer.local:7125"), "printer.local:7125")
 
 
 class MathTests(unittest.TestCase):
@@ -143,6 +170,76 @@ class MathTests(unittest.TestCase):
 
     def test_orca_row(self):
         self.assertEqual(apa.orca_row(0.017, 8.1416, 2000.0), "0.017, 8.14, 2000")
+
+    def test_result_keys_cover_evaluate(self):
+        # run_point() clears RESULT_KEYS before a re-run; a new result field must be added there
+        r = apa.evaluate({0.01: 500, 0.02: -700})
+        self.assertLessEqual(set(r) - {"notes"}, set(apa.RESULT_KEYS))
+
+
+class HelperTests(TempDirMixin, unittest.TestCase):
+    def test_recover_from_flow_log(self):
+        ks = [0.015, 0.02]
+        self.assertEqual(apa.recover_from_flow_log([9.0, -5.0, -18.0], 1, ks),
+                         {0.015: -5.0, 0.02: -18.0})
+        self.assertIsNone(apa.recover_from_flow_log([9.0, -5.0], 1, ks))       # one missing
+        self.assertIsNone(apa.recover_from_flow_log([-5.0, -18.0], None, ks))  # no baseline
+        self.assertIsNone(apa.recover_from_flow_log([1, 2, 3, 4], 1, ks))      # extra results
+
+    def test_usable(self):
+        ok = {"status": "ok", "confidence": 80, "flow": 8.14}
+        self.assertTrue(apa.usable(ok))
+        self.assertFalse(apa.usable(dict(ok, confidence=44)))
+        self.assertFalse(apa.usable(dict(ok, flow=0.0)))
+        self.assertFalse(apa.usable(dict(ok, status="error")))
+
+    def test_atomic_write_replaces_content(self):
+        d = self.tmpdir()
+        path = os.path.join(d, "out.txt")
+        apa.atomic_write(path, "one\n")
+        apa.atomic_write(path, "two\n")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "two\n")
+        self.assertEqual(os.listdir(d), ["out.txt"])
+
+    def test_atomic_write_failure_keeps_original(self):
+        d = self.tmpdir()
+        path = os.path.join(d, "out.txt")
+        apa.atomic_write(path, "one\n")
+        self.patch(apa.os, "replace", side_effect=OSError("disk full"))
+        with self.assertRaises(OSError):
+            apa.atomic_write(path, "two\n")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "one\n")
+        self.assertEqual(os.listdir(d), ["out.txt"])
+
+    def test_atomic_write_retries_locked_file(self):
+        path = os.path.join(self.tmpdir(), "out.txt")
+        real_replace = os.replace
+        calls = []
+
+        def flaky_replace(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError("locked by another program")
+            real_replace(src, dst)
+
+        self.patch(apa.os, "replace", side_effect=flaky_replace)
+        self.patch(apa.time, "sleep")
+        apa.atomic_write(path, "ok\n")
+        self.assertEqual(len(calls), 3)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ok\n")
+
+    def test_get_text_missing_file_is_empty(self):
+        mr = apa.Moonraker("printer")
+        not_found = urllib.error.HTTPError("http://printer/x", 404, "Not Found", {}, None)
+        self.patch(apa.urllib.request, "urlopen", side_effect=not_found)
+        self.assertEqual(mr._get_text("/x", 5), "")
+        server_error = urllib.error.HTTPError("http://printer/x", 500, "Boom", {}, None)
+        self.patch(apa.urllib.request, "urlopen", side_effect=server_error)
+        with self.assertRaises(urllib.error.HTTPError):
+            mr._get_text("/x", 5)
 
 
 def _macro_template(name):
@@ -197,19 +294,6 @@ class MacroParityTests(unittest.TestCase):
             max_abs = rnd.choice((0, max(abs(a0), abs(a1)) * rnd.uniform(1, 30)))
             self.check(round(k0, 3), round(a0, 3), round(k1, 3), round(a1, 3),
                        round(max_abs, 3))
-
-
-class mock_cfg:
-    """Temporarily replace MacroBehaviourTests.CFG for one test."""
-
-    def __init__(self, test, cfg):
-        self.test, self.cfg = test, cfg
-
-    def __enter__(self):
-        self.saved, self.test.CFG = self.test.CFG, self.cfg
-
-    def __exit__(self, *exc):
-        self.test.CFG = self.saved
 
 
 @unittest.skipIf(jinja2 is None, "jinja2 not installed")
@@ -267,8 +351,7 @@ class MacroBehaviourTests(unittest.TestCase):
         self.assertEqual((v["line_area"], v["ratio"], v["high_speed"]), (0.081416, 0.033849, 230.0))
 
     def test_unrelated_params_keep_mid_point(self):
-        cfg = dict(self.CFG, mid_speed=180.0, mid_accel=5000.0)
-        with mock_cfg(self, cfg):
+        with mock.patch.object(self, "CFG", dict(self.CFG, mid_speed=180.0, mid_accel=5000.0)):
             v, _ = self.set_vars(LAYER_HEIGHT=0.2, LINE_WIDTH=0.45)
             self.assertEqual((v["mid_speed"], v["mid_accel"]), (180.0, 5000.0))
             v, _ = self.set_vars(HIGH_SPEED=300)
@@ -304,7 +387,7 @@ ENVELOPE = {
     "low_accel": 2000.0, "mid_accel": 6000.0, "high_accel": 10000.0,
     "last_k_star": 0.0, "pending_valid": 0,
 }
-# name -> (true K*, area per 0.005 K); stress fails like a real macro error
+# name -> (true K*, area per 0.005 K); stress fails like a real macro error by default
 MODEL = {
     "low_anchor": (0.0172, 10000.0),
     "high_flow": (0.0471, 40000.0),   # above the default range -> moved range
@@ -314,35 +397,72 @@ MODEL = {
 
 
 class MockMoonraker:
-    def __init__(self, drop_console_for=None):
+    """Minimal Moonraker: answers the JSON-RPC calls the tool makes, simulating the macros.
+
+    Options (all optional):
+      model              per-point (K*, gain), defaults to MODEL
+      fail_stress        stress point fails like a macro error (default True)
+      drop_console_for   point whose area lines never reach the console
+      flow_log_short     flow_calculator.log misses a sweep's last result
+      send_garbage       send a non-JSON frame before each sweep's console lines
+      abort_for          point that prints "abort calibration"
+      hang_for           point whose APA_COIL_CELL never answers
+      close_for          point during which the connection is dropped
+      finish_conf_offset added to the confidence APA_FINISH_CELL reports
+      klippy_state, print_state, envelope   preflight answers
+    """
+
+    def __init__(self, **opts):
+        self.opts = opts
+        self.model = opts.get("model", MODEL)
         self.commands = []
-        self.drop_console_for = drop_console_for
+        self.methods = []
         self.flow_log = []
         self.port = None
         self._ready = threading.Event()
+        self._thread = None
+        self._loop = None
         self._stop = None
 
     def area(self, name, k):
-        k_star, gain = MODEL[name]
+        k_star, gain = self.model[name]
         return round(gain * (k_star - k) / 0.005, 3)
+
+    def log_result(self, fast, area):
+        self.flow_log.append("[INFO] Received request: loop=14, slowv=%.3f, fastv=%.3f"
+                             % (fast * 0.75, fast))
+        self.flow_log.append("[INFO] Calculation result: %d" % area)
+
+    async def send_lines(self, ws, lines):
+        for line in lines:
+            await ws.send(json.dumps({"jsonrpc": "2.0", "method": "notify_gcode_response",
+                                      "params": [line]}))
 
     async def handler(self, ws):
         async for raw in ws:
             msg = json.loads(raw)
             method, params, rid = msg["method"], msg.get("params", {}), msg["id"]
+            self.methods.append(method)
             result, error = "ok", None
             if method == "server.info":
-                result = {"klippy_state": "ready"}
+                result = {"klippy_state": self.opts.get("klippy_state", "ready")}
             elif method == "printer.objects.query":
-                result = {"status": {"gcode_macro _APA_COIL_CFG": ENVELOPE,
-                                     "print_stats": {"state": "standby"}}}
+                result = {"status": {
+                    "gcode_macro _APA_COIL_CFG": self.opts.get("envelope", ENVELOPE),
+                    "print_stats": {"state": self.opts.get("print_state", "standby")}}}
             elif method == "printer.gcode.script":
                 script = params["script"]
                 self.commands.append(script)
+                name = dict(re.findall(r"(\w+)=(\S+)", script)).get("NAME")
+                if script.startswith("APA_COIL_CELL") and name == self.opts.get("close_for"):
+                    await ws.close()
+                    return
+                if script.startswith("APA_COIL_CELL") and name == self.opts.get("hang_for"):
+                    continue  # never answered
                 lines, error = self.run_gcode(script)
-                for line in lines:
-                    await ws.send(json.dumps({"jsonrpc": "2.0", "method": "notify_gcode_response",
-                                              "params": [line]}))
+                if self.opts.get("send_garbage") and script.startswith("APA_COIL_CELL"):
+                    await ws.send("this is not json")
+                await self.send_lines(ws, lines)
             reply = {"jsonrpc": "2.0", "id": rid}
             reply.update({"error": {"code": 400, "message": error}} if error else {"result": result})
             await ws.send(json.dumps(reply))
@@ -350,30 +470,41 @@ class MockMoonraker:
     def run_gcode(self, script):
         p = dict(re.findall(r"(\w+)=(\S+)", script))
         if script.startswith("APA_COIL_CELL"):
-            if p["NAME"] == "stress":
+            if p["NAME"] == "stress" and self.opts.get("fail_stress", True):
                 return [], "!! Expected active extruder extruder, got extruder1"
+            if p["NAME"] == self.opts.get("abort_for"):
+                return ["// abort calibration: heating timeout"], None
             fast = float(p["SPEED"]) * ENVELOPE["ratio"]
             lines = ["B:28.1 /0.0 C:27.1 /0.0 T0:29.9 /220.0"]
-            for k in apa.expected_ks(float(p["MIN"]), float(p["MAX"]), float(p["STEP"])):
+            ks = apa.expected_ks(float(p["MIN"]), float(p["MAX"]), float(p["STEP"]))
+            for i, k in enumerate(ks):
                 a = self.area(p["NAME"], k)
-                self.flow_log.append("[INFO] Received request: loop=14, slowv=%.3f, fastv=%.3f"
-                                     % (fast * 0.75, fast))
-                self.flow_log.append("[INFO] Calculation result: %d" % a)
-                if p["NAME"] != self.drop_console_for:
+                if not (self.opts.get("flow_log_short") and i == len(ks) - 1):
+                    self.log_result(fast, a)
+                if p["NAME"] != self.opts.get("drop_console_for"):
                     lines.append("// k%.3f: area=%.3f" % (k, a))
             return lines, None
         if script.startswith("APA_FINISH_CELL"):
             s = apa.score(float(p["K0"]), float(p["A0"]), float(p["K1"]), float(p["A1"]),
                           float(p["MAX_ABS"]))
+            conf = s["confidence"] + self.opts.get("finish_conf_offset", 0)
             return ["// K* (zero cross): %s  ->  rounded %s" % (s["k_star"], s["k_out"]),
-                    "// Confidence: %d/100 (%s)" % (s["confidence"], s["grade"])], None
+                    "// Confidence: %d/100 (%s)" % (conf, s["grade"])], None
         return [], None
 
     def start(self):
-        threading.Thread(target=asyncio.run, args=(self._main(),), daemon=True).start()
-        self._ready.wait(10)
+        self._thread = threading.Thread(target=asyncio.run, args=(self._main(),), daemon=True)
+        self._thread.start()
+        if not self._ready.wait(10):
+            raise RuntimeError("mock Moonraker did not start")
+
+    def stop(self):
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._stop.set)
+        self._thread.join(10)
 
     async def _main(self):
+        self._loop = asyncio.get_running_loop()
         self._stop = asyncio.Event()
         async with serve(self.handler, "127.0.0.1", 0) as server:
             self.port = server.sockets[0].getsockname()[1]
@@ -382,19 +513,58 @@ class MockMoonraker:
 
 
 @unittest.skipIf(websockets is None, "websockets not installed")
-class EndToEndTests(unittest.TestCase):
-    def run_tool(self, mock, *extra):
-        out = tempfile.mkdtemp()
-        apa.main(["--host", "127.0.0.1:%d" % mock.port, "--out", out, "--tools", "0", *extra])
+class EndToEndTests(TempDirMixin, unittest.TestCase):
+    def setUp(self):
+        self.patch(apa, "CONSOLE_DRAIN_S", 0)
+        # No real HTTP in tests: flow_calculator.log is unreadable unless a test serves it
+        self.patch(apa.Moonraker, "_get_text", side_effect=OSError("no HTTP in tests"))
+
+    def start_mock(self, **opts):
+        mock_server = MockMoonraker(**opts)
+        mock_server.start()
+        self.addCleanup(mock_server.stop)
+        return mock_server
+
+    def serve_flow_log(self, mock_server, error=None):
+        """Answer flow_calculator.log downloads from the mock printer's log (or raise error)."""
+        def get_text(path, timeout):
+            if error is not None:
+                raise error
+            return "\n".join(mock_server.flow_log)
+        self.patch(apa.Moonraker, "_get_text", side_effect=get_text)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = apa.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def run_tool(self, mock_server, *extra):
+        out = self.tmpdir()
+        rc, stdout, stderr = self.main("--host", "127.0.0.1:%d" % mock_server.port,
+                                       "--out", out, "--tools", "0", *extra)
+        self.assertEqual(rc, 0, stderr)
         (session,) = os.listdir(out)
         d = os.path.join(out, session)
-        with open(os.path.join(d, "results.json"), encoding="utf-8") as f:
-            return d, json.load(f)
+        return d, self.load(d), stdout
 
+    @staticmethod
+    def load(d):
+        with open(os.path.join(d, "results.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def cells(mock_server):
+        return [c for c in mock_server.commands if c.startswith("APA_COIL_CELL")]
+
+    def only_point(self, res):
+        (p,) = res["tools"]["0"]["points"]
+        return p
+
+    # -- normal runs --------------------------------------------------------
     def test_full_suite(self):
-        mock = MockMoonraker()
-        mock.start()
-        d, res = self.run_tool(mock)
+        m = self.start_mock()
+        d, res, _ = self.run_tool(m)
         pts = {p["name"]: p for p in res["tools"]["0"]["points"]}
 
         self.assertEqual(pts["low_anchor"]["k_out"], 0.017)
@@ -422,40 +592,235 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("0.017, 8.14, 2000", orca)
         self.assertIn("0.047, 20.35, 2000", orca)
         self.assertNotIn("8.14, 10000", orca)  # weak high_force row is left out
-        self.assertTrue(mock.commands[-1].startswith("SET_HEATER_TEMPERATURE HEATER=extruder "))
+        self.assertTrue(m.commands[-1].startswith("SET_HEATER_TEMPERATURE HEATER=extruder "))
         with open(os.path.join(d, "console.log"), encoding="utf-8") as f:
             self.assertNotIn("B:28.1", f.read())
 
     def test_dry_run_sends_no_motion(self):
-        mock = MockMoonraker()
-        mock.start()
-        out = tempfile.mkdtemp()
-        apa.main(["--host", "127.0.0.1:%d" % mock.port, "--out", out, "--dry-run"])
+        m = self.start_mock()
+        out = self.tmpdir()
+        rc, stdout, _ = self.main("--host", "127.0.0.1:%d" % m.port, "--out", out, "--dry-run")
+        self.assertEqual(rc, 0)
         self.assertEqual(os.listdir(out), [])
-        self.assertTrue(all(c.startswith("SET_HEATER") for c in mock.commands))
+        self.assertEqual(m.commands, [])
+        self.assertEqual(m.methods, ["server.connection.identify", "server.info",
+                                     "printer.objects.query"])
+        self.assertIn("would send: APA_COIL_CELL NAME=center", stdout)
 
+    def test_k_star_below_range_moves_down(self):
+        m = self.start_mock(model=dict(MODEL, center=(0.002, 8000.0)))
+        _, res, _ = self.run_tool(m, "--points", "center")
+        p = self.only_point(res)
+        self.assertEqual((p["status"], p["k_out"]), ("ok", 0.002))
+        self.assertEqual([s["min"] for s in p["sweeps"]], [0.005, 0.0])
+
+    def test_retries_exhausted(self):
+        m = self.start_mock(model=dict(MODEL, center=(0.5, 1000.0)))
+        _, res, _ = self.run_tool(m, "--points", "center", "--max-retries", "1")
+        p = self.only_point(res)
+        self.assertEqual((p["status"], len(p["sweeps"])), ("kstar_above", 2))
+        self.assertIn("no sign flip after 2 sweep(s)", p["notes"])
+
+    def test_macro_mismatch_is_noted(self):
+        m = self.start_mock(finish_conf_offset=1)
+        _, res, _ = self.run_tool(m, "--points", "center")
+        self.assertTrue(any(n.startswith("macro reports") for n in self.only_point(res)["notes"]))
+
+    def test_abort_line_marks_point_error(self):
+        m = self.start_mock(abort_for="center")
+        _, res, _ = self.run_tool(m, "--points", "center")
+        p = self.only_point(res)
+        self.assertEqual(p["status"], "error")
+        self.assertIn("abort calibration: heating timeout", p["notes"])
+
+    # -- resume -------------------------------------------------------------
     def test_resume_skips_finished_points(self):
-        mock = MockMoonraker()
-        mock.start()
-        d, _ = self.run_tool(mock, "--points", "center")
-        mock.commands.clear()
-        apa.main(["--host", "127.0.0.1:%d" % mock.port, "--resume", d, "--points",
-                  "center,low_anchor"])
-        cells = [c for c in mock.commands if c.startswith("APA_COIL_CELL")]
+        m = self.start_mock()
+        d, _, _ = self.run_tool(m, "--points", "center")
+        m.commands.clear()
+        rc, _, _ = self.main("--resume", d, "--points", "center,low_anchor")  # host from session
+        self.assertEqual(rc, 0)
+        cells = self.cells(m)
         self.assertEqual(len(cells), 1)
         self.assertIn("NAME=low_anchor", cells[0])
 
+    def test_resume_runs_only_requested_tools_and_points(self):
+        m = self.start_mock()
+        d = self.tmpdir()
+        plan = apa.build_points(ENVELOPE, ["stress", "center"], False)
+        state = {"host": "127.0.0.1:%d" % m.port, "temp": 220,
+                 "envelope": {k: ENVELOPE[k] for k in apa.ENVELOPE_KEYS},
+                 "tools": {t: {"points": [dict(p) for p in plan]} for t in ("0", "1")}}
+        with open(os.path.join(d, "results.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        rc, _, _ = self.main("--resume", d, "--tools", "1", "--points", "stress,center",
+                             "--skip-stress")
+        self.assertEqual(rc, 0)
+        cells = self.cells(m)
+        self.assertEqual(len(cells), 1)
+        self.assertIn("NAME=center", cells[0])
+        self.assertIn("EXTRUDER=1", cells[0])
+        res = self.load(d)
+        self.assertNotIn("status", res["tools"]["0"]["points"][1])  # T0 center untouched
+        self.assertNotIn("status", res["tools"]["1"]["points"][0])  # T1 stress skipped
+
+    def test_resume_reruns_failed_point_cleanly(self):
+        m = self.start_mock()
+        d, res, _ = self.run_tool(m, "--points", "stress")
+        self.assertEqual(self.only_point(res)["status"], "error")
+        m.opts["fail_stress"] = False
+        m.model = dict(MODEL, stress=(0.011, 20000.0))
+        rc, _, _ = self.main("--resume", d, "--points", "stress")
+        self.assertEqual(rc, 0)
+        p = self.only_point(self.load(d))
+        self.assertEqual((p["status"], p["k_out"], p["notes"]), ("ok", 0.011, []))
+
+    # -- flow_calculator.log fallback -----------------------------------------
     def test_missing_console_lines_come_from_flow_log(self):
-        mock = MockMoonraker(drop_console_for="center")
-        mock.start()
-        orig = apa.Moonraker.get_text
-        apa.Moonraker.get_text = lambda self, path: "\n".join(mock.flow_log)
-        try:
-            _, res = self.run_tool(mock, "--points", "center")
-        finally:
-            apa.Moonraker.get_text = orig
-        (p,) = res["tools"]["0"]["points"]
+        m = self.start_mock(drop_console_for="center")
+        fast = 200 * ENVELOPE["ratio"]
+        for a in (99999, 88888, 77777, -1, -2, -3, -4):  # an older center sweep
+            m.log_result(fast, a)
+        self.serve_flow_log(m)
+        _, res, stdout = self.run_tool(m, "--points", "center")
+        p = self.only_point(res)
         self.assertEqual((p["status"], p["k_out"]), ("ok", 0.012))
+        self.assertIn("recovered 7 area value(s)", stdout)
+
+    def test_short_flow_log_is_not_trusted(self):
+        m = self.start_mock(drop_console_for="center", flow_log_short=True)
+        m.log_result(200 * ENVELOPE["ratio"], 55555)  # stale value that could fill the gap
+        self.serve_flow_log(m)
+        _, res, stdout = self.run_tool(m, "--points", "center", "--max-retries", "0")
+        p = self.only_point(res)
+        self.assertEqual(p["status"], "no_data")
+        self.assertEqual(p["sweeps"][0]["samples"], [])
+        self.assertIn("can't be matched to this sweep", stdout)
+
+    def test_broken_flow_log_download_does_not_stop_run(self):
+        m = self.start_mock(drop_console_for="center")
+        self.serve_flow_log(m, error=http.client.IncompleteRead(b"partial"))
+        _, res, stdout = self.run_tool(m, "--points", "center", "--max-retries", "0")
+        self.assertEqual(self.only_point(res)["status"], "no_data")
+        self.assertIn("can't be matched", stdout)
+
+    # -- failures -----------------------------------------------------------
+    def test_bad_message_does_not_end_session(self):
+        m = self.start_mock(send_garbage=True)
+        _, res, _ = self.run_tool(m, "--points", "center")
+        p = self.only_point(res)
+        self.assertEqual((p["status"], p["k_out"]), ("ok", 0.012))
+
+    def test_connection_drop_mid_sweep(self):
+        m = self.start_mock(close_for="center")
+        d = self.tmpdir()
+        rc, _, stderr = self.main("--host", "127.0.0.1:%d" % m.port, "--out", d,
+                                  "--points", "low_anchor,center")
+        self.assertEqual(rc, 1)
+        self.assertIn("Moonraker connection lost", stderr)
+        self.assertIn("--resume", stderr)
+        (session,) = os.listdir(d)
+        pts = {p["name"]: p for p in self.load(os.path.join(d, session))["tools"]["0"]["points"]}
+        self.assertEqual(pts["low_anchor"]["status"], "ok")  # saved before the drop
+        self.assertNotIn("status", pts["center"])
+
+    def test_hung_sweep_times_out(self):
+        m = self.start_mock(hang_for="center")
+        self.patch(apa, "SWEEP_TIMEOUT_PER_K", 0)
+        self.patch(apa, "SWEEP_TIMEOUT_EXTRA", 0.3)
+        rc, _, stderr = self.main("--host", "127.0.0.1:%d" % m.port, "--out", self.tmpdir(),
+                                  "--points", "center")
+        self.assertEqual(rc, 1)
+        self.assertIn("center did not finish", stderr)
+        self.assertTrue(m.commands[-1].startswith("SET_HEATER_TEMPERATURE"))  # still sent
+
+    def test_preflight_errors(self):
+        cases = [({"klippy_state": "startup"}, "Klipper is not ready"),
+                 ({"envelope": {}}, "adaptive_pa_macro.cfg is not loaded"),
+                 ({"print_state": "printing"}, "Printer is busy")]
+        for opts, text in cases:
+            with self.subTest(text=text):
+                m = self.start_mock(**opts)
+                rc, _, stderr = self.main("--host", "127.0.0.1:%d" % m.port, "--dry-run")
+                self.assertEqual(rc, 1)
+                self.assertIn(text, stderr)
+                self.assertEqual(m.commands, [])
+
+    def test_unreachable_printer_returns_error(self):
+        with socket.socket() as s:  # a port nothing listens on
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        rc, _, stderr = self.main("--host", "127.0.0.1:%d" % port, "--dry-run")
+        self.assertEqual(rc, 1)
+        self.assertIn("Cannot reach Moonraker", stderr)
+
+
+class ArgumentTests(TempDirMixin, unittest.TestCase):
+    def assert_usage_error(self, argv, text):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            apa.main(argv)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(text, err.getvalue())
+
+    def write_session(self, state):
+        d = self.tmpdir()
+        with open(os.path.join(d, "results.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        return d
+
+    def test_unknown_point(self):
+        self.assert_usage_error(["--host", "x", "--points", "centre"], "unknown point(s) centre")
+
+    def test_missing_resume_dir(self):
+        self.assert_usage_error(["--resume", os.path.join(self.tmpdir(), "nope")],
+                                "cannot resume")
+
+    def test_resume_temperature_change(self):
+        d = self.write_session({"host": "x", "temp": 220, "tools": {}})
+        self.assert_usage_error(["--resume", d, "--temp", "230"], "measured at 220 C")
+
+    def test_non_positive_temperature(self):
+        self.assert_usage_error(["--host", "x", "--temp", "0"], "--temp must be")
+
+    def test_host_and_parse_log_are_exclusive(self):
+        self.assert_usage_error(["--host", "x", "--parse-log", "f.txt"], "not allowed with")
+
+
+class ParseLogTests(TempDirMixin, unittest.TestCase):
+    def run_parse_log(self, text):
+        path = os.path.join(self.tmpdir(), "console.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(apa.main(["--parse-log", path]), 0)
+        return out.getvalue()
+
+    def test_rows_from_saved_console(self):
+        # center point of the real T3 run (PLA, 220 C)
+        out = self.run_parse_log(
+            "// Point: center | Tool T3 (extruder3) | MODE=MEASURE TEMP=220\n"
+            "// XY: speed=200.0 mm/s  accel=6000.0  ->  Q=16.2832 mm3/s\n"
+            "// k0.005: area=27191.000\n// k0.010: area=6844.000\n"
+            "// k0.015: area=-10963.000\n// k0.020: area=-24837.000\n")
+        self.assertIn("=== T3", out)
+        self.assertIn("0.012, 16.28, 6000", out)
+
+    def test_point_without_xy_banner_is_left_out(self):
+        out = self.run_parse_log("// Point: center | Tool T0 (extruder)\n"
+                                 "// k0.010: area=2880.000\n// k0.015: area=-5120.000\n")
+        self.assertIn("no XY banner", out)
+        self.assertIn("(no usable rows)", out)
+
+    def test_no_banners(self):
+        path = os.path.join(self.tmpdir(), "empty.txt")
+        open(path, "w").close()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(apa.main(["--parse-log", path]), 1)
+        self.assertIn("No APA test point banners", err.getvalue())
 
 
 if __name__ == "__main__":
