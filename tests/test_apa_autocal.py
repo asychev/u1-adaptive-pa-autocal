@@ -147,6 +147,16 @@ class MathTests(unittest.TestCase):
         self.assertEqual(r["bracket"][:3:2], [0.01, 0.015])
         self.assertTrue(any("noisy" in n for n in r["notes"]))
 
+    def test_no_flip_reason(self):
+        below = {0.005: -137, 0.01: -1786, 0.035: -9977}  # reviewer's high_force sweep
+        self.assertEqual(apa.no_flip_reason("kstar_below", below),
+                         "no sign flip, every area < 0, K* below 0.005")
+        self.assertEqual(apa.no_flip_reason("kstar_above", {0.005: 9, 0.035: 1}),
+                         "no sign flip, every area > 0, K* above 0.035")
+        self.assertEqual(apa.no_flip_reason("no_flip", {0.01: -5, 0.02: 3}),
+                         "no sign flip, signs change but no + to - bracket")
+        self.assertEqual(apa.no_flip_reason("no_data", {}), "no area values received")
+
     def test_retry_ranges(self):
         above = {k: 1000.0 for k in apa.expected_ks(0.005, 0.040, 0.005)}
         lo, hi, st = apa.retry_range(above, "kstar_above", 0.005, 0.040, 0.005)
@@ -622,7 +632,14 @@ class EndToEndTests(TempDirMixin, unittest.TestCase):
         _, res, _ = self.run_tool(m, "--points", "center", "--max-retries", "1")
         p = self.only_point(res)
         self.assertEqual((p["status"], len(p["sweeps"])), ("kstar_above", 2))
-        self.assertIn("no sign flip after 2 sweep(s)", p["notes"])
+        self.assertIn("no sign flip, every area > 0, K* above 0.070 (2 sweep(s))", p["notes"])
+
+    def test_no_flip_reason_printed_with_retries_off(self):
+        # every area < 0 from the first K, like the reviewer's high_force run
+        m = self.start_mock(model=dict(MODEL, center=(0.002, 8000.0)))
+        _, res, stdout = self.run_tool(m, "--points", "center", "--max-retries", "0")
+        self.assertEqual(self.only_point(res)["status"], "kstar_below")
+        self.assertIn("center: no sign flip, every area < 0, K* below 0.005", stdout)
 
     def test_macro_mismatch_is_noted(self):
         m = self.start_mock(finish_conf_offset=1)

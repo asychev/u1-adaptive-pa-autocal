@@ -208,6 +208,17 @@ def evaluate(samples: Dict[float, float]) -> dict:
     return out
 
 
+def no_flip_reason(status: str, samples: Dict[float, float]) -> str:
+    """Why a sweep gave no K*, for the console and the point's notes."""
+    if status == "kstar_below":
+        return "no sign flip, every area < 0, K* below %.3f" % min(samples)
+    if status == "kstar_above":
+        return "no sign flip, every area > 0, K* above %.3f" % max(samples)
+    if status == "no_flip":
+        return "no sign flip, signs change but no + to - bracket"
+    return "no area values received"
+
+
 def retry_range(samples: Dict[float, float], status: str, k_min: float,
                 k_max: float, k_step: float) -> Optional[Tuple[float, float, float]]:
     """Next (MIN, MAX, STEP) when the sweep did not cross zero."""
@@ -632,8 +643,10 @@ class Session:
                 break
             nxt = retry_range(samples, res["status"], k_min, k_max, k_step)
             if nxt is None or retries >= self.args.max_retries:
+                reason = no_flip_reason(res["status"], samples)
+                print("    %s: %s" % (p["name"], reason), flush=True)
                 p.update(res)
-                p["notes"].append("no sign flip after %d sweep(s)" % len(p["sweeps"]))
+                p["notes"].append("%s (%d sweep(s))" % (reason, len(p["sweeps"])))
                 return
             retries += 1
             print("    %s: every area %s 0 -> moving K range" % (
