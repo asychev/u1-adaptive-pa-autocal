@@ -105,15 +105,15 @@ Using default printer parameters:
 
 $$\text{Line Area: } A_{\text{line}} = 0.2 \cdot (0.45 - 0.2) + \pi \cdot (0.1)^2 = \mathbf{0.081416\text{ mm}^2}$$
 
-$$\text{Filament Area: } A_{\text{fil}} = \pi \cdot (0.875)^2 = \mathbf{2.405157\text{ mm}^2}$$
+$$\text{Filament Area: } A_{\text{fil}} = \pi \cdot (0.875)^2 = \mathbf{2.405282\text{ mm}^2}$$
 
-$$\text{Extrusion Ratio: } R = \frac{0.081416}{2.405157} = \mathbf{0.033851}$$
+$$\text{Extrusion Ratio: } R = \frac{0.081416}{2.405282} = \mathbf{0.033849}$$
 
 $$\text{Volumetric Flow: } Q = 100 \cdot 0.081416 = \mathbf{8.14\text{ mm}^3\text{/s}}$$
 
-$$\text{Extruder Speed: } v_E = 100 \cdot 0.033851 = \mathbf{3.39\text{ mm/s}}$$
+$$\text{Extruder Speed: } v_E = 100 \cdot 0.033849 = \mathbf{3.38\text{ mm/s}}$$
 
-$$\text{Extruder Acceleration: } a_E = 2000 \cdot 0.033851 \approx \mathbf{68\text{ mm/s}^2}$$
+$$\text{Extruder Acceleration: } a_E = 2000 \cdot 0.033849 \approx \mathbf{68\text{ mm/s}^2}$$
 
 These conversions allow pure-E test steps executed at the discard position to precisely emulate nozzle pressure states experienced during actual printing at target $(v_{\text{XY}}, a_{\text{XY}})$.
 

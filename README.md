@@ -30,7 +30,9 @@ PA, flow_mm3_s, accel_mm_s2
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | Install, quick start, presets, troubleshooting, command reference |
 | [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) | Residual `area`, box design, confidence scoring, kinematics |
 | [`docs/COIL_DATA_CAPTURE.md`](docs/COIL_DATA_CAPTURE.md) | Optional coil frequency capture and waveform analysis |
+| [`scripts/apa_autocal.py`](scripts/apa_autocal.py) | Runs the suite over Moonraker and finishes every point automatically (Orca rows + fallback PA) |
 | [`scripts/coil_dump_client.py`](scripts/coil_dump_client.py) | Optional coil frequency capture / plot (Moonraker or UDS) |
+| [`tests/`](tests/) | Tests for the automation script and macro math (see [Running tests](#running-tests)) |
 | [`docs/images/`](docs/images/) | README/YouTube thumbnail + example coil scope captures |
 
 ## Quick install (printer)
@@ -42,14 +44,35 @@ PA, flow_mm3_s, accel_mm_s2
 [include adaptive_pa_macro.cfg]
 ```
 
-3. Run a full suite (example: tool 0, 220 °C):
+   On paxx12 extended firmware, put the file in `config/extended/klipper/` instead: it is included automatically and survives firmware updates, which rewrite `printer.cfg`.
+
+## Quick start: automated (recommended)
+
+From a computer on the same network, with [uv](https://docs.astral.sh/uv/) (installs Python and dependencies automatically):
+
+```bash
+uv run scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
+```
+
+or with your own Python 3.9+:
+
+```bash
+pip install -r requirements.txt
+python3 scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
+```
+
+The script runs the 5-point suite, reads every `area` value from Moonraker, re-runs points whose sweep missed the zero crossing, and prints the paste-ready OrcaSlicer rows plus a fallback static PA. Results are saved to `apa_results/<timestamp>/`. Details: [user guide §2](docs/USER_GUIDE.md#2-automated-run-recommended).
+
+## Quick start: manual (Fluidd / Mainsail / touchscreen)
+
+1. Run a full suite (example: tool 0, 220 °C):
 
 ```gcode
 APA_COIL_RUN_ALL EXTRUDER=0 TEMP=220
 ```
 
-4. For each test point, find the `area` sign flip and run `APA_FINISH_CELL` / `APA_FINISH_LAST` as described in the [user guide](docs/USER_GUIDE.md).
-5. Paste the resulting rows into OrcaSlicer → Filament → Adaptive pressure advance.
+2. For each test point, find the `area` sign flip and run `APA_FINISH_CELL` / `APA_FINISH_LAST` as described in the [user guide](docs/USER_GUIDE.md).
+3. Paste the resulting rows into OrcaSlicer → Filament → Adaptive pressure advance.
 
 Full walkthrough: **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)** · narrative write-up: **[blog](https://garagenotes.lmnt.co/Snapmaker-U1-Adaptive-Pressure-Advance-auto-calibration.html)**.
 
@@ -75,7 +98,17 @@ Then run `APA_COIL_*` in Fluidd; press Enter when the point finishes. See **[doc
 - Snapmaker U1 (or compatible stack) with working `[flow_calibrator]` / inductance coil flow sensing
 - Stock `FLOW_MEASURE_K` / `FLOW_CALIBRATE` (no custom Klipper Python required for the macros)
 - OrcaSlicer Adaptive Pressure Advance table support
-- Optional client: Python 3.8+, `numpy`, `matplotlib`
+- Automation script: Python 3.9+, `websockets` (or just `uv`)
+- Optional coil client: Python 3.8+, `numpy`, `matplotlib`
+
+## Running tests
+
+```bash
+uv run --no-project --with pytest --with jinja2 --with "websockets>=14" pytest tests
+# or: pip install pytest jinja2 websockets && python -m pytest tests
+```
+
+`jinja2` renders the real macros from `adaptive_pa_macro.cfg` to check the Python scoring and the envelope math against them; `websockets` runs the end-to-end test against a mock Moonraker.
 
 ## License
 

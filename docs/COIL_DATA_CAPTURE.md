@@ -22,14 +22,14 @@ FREQUENCY_MEASURE PROBE=…              FLOW_MEASURE_K / FLOW_CALIBRATE
   (one long external buffer)             (short internal client per K)
         │                                      │
         ▼                                      ▼
-gcodes/frequency_data/                 Console: k0.010: area: 1278
+gcodes/frequency_data/                 Console: k0.010: area=1278.000
   frequency-<sensor>-<name>.csv        Optional per-K dumps under
   (scope plot of whole session)          frequency_data/flow_test/…
 ```
 
 | Source | Created by | Use |
 |--------|------------|-----|
-| `k0.xxx: area: …` in Fluidd console | APA / `FLOW_MEASURE_K` | **Required** for $K^*$ and Orca rows |
+| `k0.xxx: area=…` in Fluidd console | APA / `FLOW_MEASURE_K` | **Required** for $K^*$ and Orca rows |
 | `frequency-<sensor>-<name>.csv` | `FREQUENCY_MEASURE` via dump client (or manual G-code) | Optional full-session waveform |
 | `freq-k0.xxxxx.csv` under `flow_test/` | Stock measure path (when enabled) | Optional per-K short dumps |
 
@@ -50,7 +50,7 @@ python3 scripts/coil_dump_client.py \
 APA_COIL_CENTER EXTRUDER=2 MODE=MEASURE TEMP=220
 ```
 
-When the last `k0.xxx: area:` line has printed and the point finishes, press **Enter** in Terminal 1. The client sends:
+When the last `k0.xxx: area=` line has printed and the point finishes, press **Enter** in Terminal 1. The client sends:
 
 ```gcode
 FREQUENCY_MEASURE PROBE=extruder2 NAME=apa_center_t2
@@ -153,15 +153,15 @@ Firmware `area` is a **signed residual** over transition windows (aligned with a
 
 | Block | Console (example center run) | Waveform cue |
 |-------|------------------------------|--------------|
-| $k = 0.015$ | `area: -6811` (just past zero-cross) | Most regular teeth; peaks/troughs look **good** by eye |
-| $k = 0.020$ | `area: -19159` | Slightly deeper troughs / sharper corners (**slightly over**) |
-| $k = 0.025$ | `area: -27580` | Obvious overshoot and deep undershoot (**clearly over**) |
+| $k = 0.015$ | `area=-6811.000` (just past zero-cross) | Most regular teeth; peaks/troughs look **good** by eye |
+| $k = 0.020$ | `area=-19159.000` | Slightly deeper troughs / sharper corners (**slightly over**) |
+| $k = 0.025$ | `area=-27580.000` | Obvious overshoot and deep undershoot (**clearly over**) |
 
 On that same run the **sign flip** was earlier:
 
 ```text
-k0.010: area: +1278    ← still slightly under-PA
-k0.015: area: -6811    ← first negative (mild over-PA)
+k0.010: area=1278.000   ← still slightly under-PA
+k0.015: area=-6811.000  ← first negative (mild over-PA)
 → K* ≈ 0.011
 ```
 
