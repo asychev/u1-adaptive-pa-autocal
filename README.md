@@ -46,24 +46,7 @@ PA, flow_mm3_s, accel_mm_s2
 
    On paxx12 extended firmware, put the file in `config/extended/klipper/` instead: it is included automatically and survives firmware updates, which rewrite `printer.cfg`.
 
-## Quick start: automated (recommended)
-
-From a computer on the same network, with [uv](https://docs.astral.sh/uv/) (installs Python and dependencies automatically):
-
-```bash
-uv run scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
-```
-
-or with your own Python 3.9+:
-
-```bash
-pip install -r requirements.txt
-python3 scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
-```
-
-The script runs the 5-point suite, reads every `area` value from Moonraker, re-runs points whose sweep missed the zero crossing, and prints the paste-ready OrcaSlicer rows plus a fallback static PA. Results are saved to `apa_results/<timestamp>/`. Details: [user guide §2](docs/USER_GUIDE.md#2-automated-run-recommended).
-
-## Quick start: manual (Fluidd / Mainsail / touchscreen)
+## Quick start: Using Printer Macros (Fluidd / Mainsail)
 
 1. Run a full suite (example: tool 0, 220 °C):
 
@@ -75,6 +58,26 @@ APA_COIL_RUN_ALL EXTRUDER=0 TEMP=220
 3. Paste the resulting rows into OrcaSlicer → Filament → Adaptive pressure advance.
 
 Full walkthrough: **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)** · narrative write-up: **[blog](https://garagenotes.lmnt.co/Snapmaker-U1-Adaptive-Pressure-Advance-auto-calibration.html)**.
+
+## Quick Start: Fully Automated Run and Calculations (local computer)
+This script runs the same macros as above by calling the printer directly from your local computer, automatically parse the results and generate the Adaptive Pressure Advance table so you don't have to! (See User Guide for more information)
+
+From a computer on the same network and Python 3.9+:
+
+```bash
+pip install -r requirements.txt
+python3 scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
+```
+
+OR
+
+Optionally you can use [uv](https://docs.astral.sh/uv/) (installs Python and dependencies automatically):
+
+```bash
+uv run scripts/apa_autocal.py --host PRINTER_IP --tools 0 --temp 220
+```
+
+The script runs the 5-point suite, reads every `area` value from Moonraker, re-runs points whose sweep missed the zero crossing, and prints the paste-ready OrcaSlicer rows plus a fallback static PA. Results are saved to `apa_results/<timestamp>/`. Details: [user guide §2](docs/USER_GUIDE.md#2-automated-run-recommended).
 
 ## Optional: coil waveform capture
 
